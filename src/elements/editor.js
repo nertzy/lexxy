@@ -60,6 +60,7 @@ export class LexicalEditorElement extends HTMLElement {
   static observedAttributes = [ "autocapitalize", "connected", "required" ]
 
   #initialValue = ""
+  #hasLiveEditor = false
   #previousInternalFormValue = null
 
   #initializeEventDispatched = false
@@ -79,6 +80,7 @@ export class LexicalEditorElement extends HTMLElement {
     super()
     this.internals = this.attachInternals()
     this.internals.role = "presentation"
+    this.#upgradeValueProperty()
   }
 
   get uploadRequests() {
@@ -92,6 +94,7 @@ export class LexicalEditorElement extends HTMLElement {
     this.#disposables.push(this.extensions)
 
     this.editor = this.#createEditor()
+    this.#hasLiveEditor = true
     this.#disposables.push(this.editor)
     this.#disposables.push(this.#listeners)
 
@@ -137,6 +140,7 @@ export class LexicalEditorElement extends HTMLElement {
 
     this.#clearCachedValues()
     this.#reset() // Prevent hangs with Safari when morphing
+    this.#hasLiveEditor = false
   }
 
   attributeChangedCallback(name, oldValue, newValue) {
@@ -396,11 +400,24 @@ export class LexicalEditorElement extends HTMLElement {
     return !!this.editor && isEditorFocused(this.editor)
   }
 
+  // Until the editor connects, and after it disconnects, there's no live editor to
+  // read or write. The value is kept to load on connect, as #loadInitialValue does
+  // with the one saved on disconnect, so frameworks can set it before inserting
+  // the element, the way they do with built-in form controls.
   get value() {
+    if (!this.#hasLiveEditor) return this.valueBeforeDisconnect ?? this.getAttribute("value") ?? ""
+
     return this.cachedValue ??= this.#readSanitizedEditorValue()
   }
 
   set value(html) {
+    if (!this.#hasLiveEditor) {
+      // A nullish value clears the editor, as it does when connected, rather than
+      // falling back to the value attribute.
+      this.valueBeforeDisconnect = html ?? ""
+      return
+    }
+
     const editorHasFocus = this.#isContentFocused
 
     this.editor.update(() => {
@@ -1015,6 +1032,16 @@ export class LexicalEditorElement extends HTMLElement {
     }
   }
 
+  // A value assigned before the element was upgraded is a plain property that
+  // hides the accessor. Move it to the accessor so it loads on connect.
+  #upgradeValueProperty() {
+    if (Object.hasOwn(this, "value")) {
+      const value = this.value
+      delete this.value
+      this.value = value
+    }
+  }
+
   #reconnect() {
     this.disconnectedCallback()
     this.valueBeforeDisconnect = null
@@ -1056,19 +1083,18 @@ function $getReadableTextContent(node) {
   return node.getTextContent()
 }
 
-// Lexical's HTML export (as of 0.52) writes two things Lexxy has never stored:
-// a marked terminator <br> after a block's trailing line break, mirroring the one
-// the reconciler adds to the live DOM, and block indentation as
-// data-lexical-indent, which Lexxy's content styles don't render. Drop both so
-// the value keeps the format it has always had.
+// Lexical's HTML export (as of 0.52) writes two things Lexxy doesn't store as
+// they are: a marked terminator <br> after a block's trailing line break,
+// mirroring the one the reconciler adds to the live DOM, and block indentation as
+// data-lexical-indent, which Lexxy's content styles don't render.
 //
-// List items are the exception: they keep the terminator as a plain <br>, the
-// way Trix stores them. A <br> that ends a block renders nothing and is dropped
-// on import, so without it a Shift+Enter at the end of an item would vanish from
-// the rendered content and from the editor on reload.
+// The terminator stays, as a plain <br>, the way Trix stores it. A <br> that ends
+// a block renders nothing and is dropped on import, so without it a Shift+Enter
+// at the end of a line would vanish from the rendered content, and each save and
+// reload would drop one more trailing line break. The indentation is removed.
 //
-// They're removed from the exported elements rather than from the HTML string,
-// where text that reads the same would go too.
+// Both are changed on the exported elements rather than in the HTML string,
+// where text that reads the same would change too.
 function $generateHtmlWithoutExportArtifacts(editor) {
   const container = $generateDOMFromNodes(document.createElement("div"), null, editor)
 
@@ -1077,18 +1103,10 @@ function $generateHtmlWithoutExportArtifacts(editor) {
   }
 
   for (const lineBreak of container.querySelectorAll("br[data-lexical-managed-linebreak]")) {
-    if (isLastChildOfListItem(lineBreak)) {
-      lineBreak.removeAttribute("data-lexical-managed-linebreak")
-    } else {
-      lineBreak.remove()
-    }
+    lineBreak.removeAttribute("data-lexical-managed-linebreak")
   }
 
   return container.innerHTML
-}
-
-function isLastChildOfListItem(node) {
-  return node.parentElement?.tagName === "LI" && !node.nextSibling
 }
 
 // An empty editor still holds one paragraph, so there is somewhere to type and
